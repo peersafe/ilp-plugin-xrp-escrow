@@ -13,6 +13,12 @@ const Translate = require('./translate')
 const Condition = require('./condition')
 const Errors = require('./errors')
 
+const uuid = require('uuid')
+const http = require('http')
+const accepts = require('accepts')
+
+const defaultMessageTimeout = 5000
+
 module.exports = class PluginXrpEscrow extends EventEmitter2 {
   constructor (opts) {
     super()
@@ -26,6 +32,7 @@ module.exports = class PluginXrpEscrow extends EventEmitter2 {
     this._submitted = {}
     this._notesToSelf = {}
     this._fulfillments = {}
+    this._connector = opts.connector || {}
     this._rpcUris = opts.rpcUris || {}
 
     this.transferQueue = Promise.resolve()
@@ -53,17 +60,18 @@ module.exports = class PluginXrpEscrow extends EventEmitter2 {
 
     // set up RPC if peer has your RPC uri
     this._rpc = new HttpRpc(this)
-    this._rpc.addMethod('send_message', this._handleSendMessage)
+    this._rpc.addMethod('send_message', this._handleIncomingMessage)
     this.isAuthorized = () => true
     this.receive = co.wrap(this._rpc._receive).bind(this._rpc)
+    this.pendingRequests = {}
   }
 
   // used when peer has enabled rpc
-  async _handleSendMessage (message) {
+  /*async _handleSendMessage (message) {
     // TODO: validate message
     this.emitAsync('incoming_message', message)
     return true
-  }
+  }*/
 
   async connect () {
     if (this._connected) return
@@ -107,7 +115,8 @@ module.exports = class PluginXrpEscrow extends EventEmitter2 {
     return {
       prefix: this._prefix,
       currencyScale: 6,
-      currencyCode: 'XRP'
+      currencyCode : 'XRP',
+      connectors : this._connector
     }
   }
 
@@ -279,31 +288,131 @@ module.exports = class PluginXrpEscrow extends EventEmitter2 {
     })
   }
 
-  async sendMessage (_message) {
-    assert(this._connected, 'plugin must be connected before sendMessage')
+  async registerRequestHandler(requestHandler)
+  {
+    if(this.requestHandler)
+    {
+      throw new Error('RequestHandlerAlreadyRegisteredError');
+    }
+    this.requestHandler = requestHandler;
+  }
 
-    if (this._rpcUris[_message.to]) {
-      this._rpc.call(
-        this._rpcUris[_message.to],
-        'send_message',
-        this._prefix,
-        [_message])
+  async deregisterRequestHandler()
+  {
+    this.requestHandler = null;
+  }
 
-      this.emitAsync('outgoing_message', _message)
+  //* _handleIncomingMessage (message, messageId) {
+  * _handleIncomingMessage (message) {
+    const pendingRequest = this.pendingRequests[message.id]
+    // `message` is a ResponseMessage
+    if (pendingRequest) {
+      delete this.pendingRequests[message.id]
+      yield this.emitAsync('incoming_response', message)
+      pendingRequest.resolve(message)
       return
     }
+    // `message` is a RequestMessage
+    yield this.emitAsync('incoming_request', message)
+    if (!this.requestHandler) return
+    const responseMessage = yield this.requestHandler(message).then((responseMessage) => {
+      if (!responseMessage) {
+        throw new Error('No matching handler for request')
+      }
+      return responseMessage
+    }).catch((err) => {
+      return {
+        ledger: message.ledger,
+        from: message.to,
+        to: message.from,
+        ilp: IlpPacket.serializeIlpError({
+          code: 'F00',
+          name: 'Bad Request',
+          triggeredBy: this.getAccount(),
+          forwardedBy: [],
+          triggeredAt: new Date(),
+          data: JSON.stringify({message: err.message})
+        }).toString('base64')
+      }
+    })
+    yield this.emitAsync('outgoing_response', responseMessage)
+    return new Promise((resolve,reject) => {
+      resolve(responseMessage);
+    })
+    //return yield this._sendMessage(Object.assign({id: message.id}, responseMessage))
+  }
 
-    const message = Object.assign({}, _message)
+  sendRequest (message) {
+    return co.wrap(this._sendRequest).call(this, message)
+  }
+
+  * _sendRequest (message) {
+    const requestId = message.id || uuid()
+    const responded = new Promise((resolve, reject) => {
+      this.pendingRequests[requestId] = {resolve, reject}
+      
+      this._sendMessage(message).then((responsePacket) => {
+        return resolve(responsePacket)
+      }).catch((err)=>{
+        delete this.pendingRequests[requestId]
+        console.log("catch _sendmessage err : " + err)
+        reject(err)})
+      })
+
+    yield this.emitAsync('outgoing_request', message)
+    return yield Promise.race([
+      responded,
+      wait(message.timeout || defaultMessageTimeout)
+        .then(() => {
+          delete this.pendingRequests[requestId]
+          throw new Error('sendRequest timed out')
+        })
+    ])
+  }
+
+  async _sendMessage (paramMessage) {
+    //assert(this._connected, 'plugin must be connected before sendMessage')
+    if (!this._connected) {
+      throw new Error('Must be connected before sendRequest can be called')
+    }
+    if (this._rpcUris[paramMessage.to]) {
+      const resPacket = await this._rpc.call(
+        this._rpcUris[paramMessage.to],
+        'send_message',
+        this._prefix,
+        [paramMessage]).then((responsePacket) => {
+          return responsePacket
+        }).catch((err) => {          
+          console.log("catch call err : " + err) 
+        })        
+      this.emitAsync('outgoing_message', paramMessage)
+      return resPacket
+    }
+    const message = Object.assign({}, paramMessage)
     debug('preparing to send message:', message)
+    
     if (message.account) {
       message.to = message.account
     }
-
+    if (message.ledger !== this._prefix) {
+      throw new errors.InvalidFieldsError('invalid ledger')
+    }
     if (typeof message.to !== 'string' || !message.to.startsWith(this._prefix)) {
       throw new Error('message.to "' + message.to + '" does not start with ' + this._prefix)
     }
+    if (typeof message.id !== 'string') {
+      throw new errors.InvalidFieldsError('invalid id field')
+    }
+    if (message.ilp !== undefined && typeof message.ilp !== 'string') {
+      throw new errors.InvalidFieldsError('invalid ilp field')
+    }
 
     const localAddress = message.to.substring(this._prefix.length)
+    message.data = {
+      id: message.id,
+      ilp: message.ilp,
+      //custom: message.custom
+    }
     const tx = await this._api.preparePayment(this._address, {
       source: {
         address: this._address,
@@ -389,3 +498,16 @@ module.exports = class PluginXrpEscrow extends EventEmitter2 {
     }
   }
 }
+
+function wait (ms,unref)
+{
+  if (ms === Infinity) {
+    return new Promise((resolve) => {})
+  }
+
+  return new Promise((resolve) => {
+    const timeout = setTimeout(resolve, ms)
+    if (unref) timeout.unref()
+  })
+}
+
