@@ -33,7 +33,19 @@ module.exports = class PluginXrpEscrow extends EventEmitter2 {
     this._notesToSelf = {}
     this._fulfillments = {}
     this._connector = opts.connector || {}
-    this._rpcUris = opts.rpcUris || {}
+    this._rpcSwitch = opts.rpcSwitch
+    if(this._rpcSwitch)
+    {
+      if(opts.rpcUris === undefined || JSON.stringify(opts.rpcUris) === "{}")
+      {
+        console.log("Error : rpcUris can't find,please check!");
+      }
+      else
+      {
+        //this._rpcUris = opts.rpcUris || {}
+        this._rpcUris = opts.rpcUris;
+      }
+    }
 
     this.transferQueue = Promise.resolve()
 
@@ -310,7 +322,9 @@ module.exports = class PluginXrpEscrow extends EventEmitter2 {
       delete this.pendingRequests[message.id]
       yield this.emitAsync('incoming_response', message)
       pendingRequest.resolve(message)
-      return
+      return new Promise((resolve,reject) => {
+      resolve("finishHandleMessage");
+    })
     }
     // `message` is a RequestMessage
     yield this.emitAsync('incoming_request', message)
@@ -347,12 +361,18 @@ module.exports = class PluginXrpEscrow extends EventEmitter2 {
   }
 
   * _sendRequest (message) {
-    const requestId = message.id || uuid()
+    const requestId = message.id || uuid();
+    if (message.id === undefined) {
+      message.id = requestId
+    }
     const responded = new Promise((resolve, reject) => {
       this.pendingRequests[requestId] = {resolve, reject}
       
       this._sendMessage(message).then((responsePacket) => {
-        return resolve(responsePacket)
+        if(this._rpcSwitch){
+          return resolve(responsePacket)
+        }
+        return
       }).catch((err)=>{
         delete this.pendingRequests[requestId]
         console.log("catch _sendmessage err : " + err)
@@ -360,14 +380,17 @@ module.exports = class PluginXrpEscrow extends EventEmitter2 {
       })
 
     yield this.emitAsync('outgoing_request', message)
-    return yield Promise.race([
-      responded,
-      wait(message.timeout || defaultMessageTimeout)
-        .then(() => {
-          delete this.pendingRequests[requestId]
-          throw new Error('sendRequest timed out')
-        })
-    ])
+    if(this._rpcSwitch){
+      return yield Promise.race([
+        responded,
+        wait(message.timeout || defaultMessageTimeout)
+          .then(() => {
+            delete this.pendingRequests[requestId]
+            throw new Error('sendRequest timed out')
+          })
+      ])
+    }
+    return responded
   }
 
   async _sendMessage (paramMessage) {
@@ -375,7 +398,7 @@ module.exports = class PluginXrpEscrow extends EventEmitter2 {
     if (!this._connected) {
       throw new Error('Must be connected before sendRequest can be called')
     }
-    if (this._rpcUris[paramMessage.to]) {
+    if (this._rpcUris !== undefined && this._rpcUris[paramMessage.to]) {
       const resPacket = await this._rpc.call(
         this._rpcUris[paramMessage.to],
         'send_message',
@@ -383,9 +406,10 @@ module.exports = class PluginXrpEscrow extends EventEmitter2 {
         [paramMessage]).then((responsePacket) => {
           return responsePacket
         }).catch((err) => {          
-          console.log("catch call err : " + err) 
+          console.log("catch call err : " + err)
         })        
       this.emitAsync('outgoing_message', paramMessage)
+      delete this.pendingRequests[paramMessage.id];
       return resPacket
     }
     const message = Object.assign({}, paramMessage)
@@ -495,6 +519,24 @@ module.exports = class PluginXrpEscrow extends EventEmitter2 {
     } else if (transaction.TransactionType === 'Payment') {
       const message = Translate.paymentToMessage(this, ev)
       this.emitAsync(message.direction + '_message', message)
+      const newMessage = {
+        from : message.from,
+        id : message.data.id,
+        ilp : message.data.ilp,
+        ledger : message.ledger,
+        to : message.to
+      }
+      if(message.direction === "incoming")
+      {
+        console.log("message.direction === incoming")
+        co.wrap(this._handleIncomingMessage).call(this,newMessage).then((responcePkt) => {
+          if(responcePkt !== "finishHandleMessage") {
+            responcePkt.id = newMessage.id;
+            this._sendMessage(responcePkt)
+          }
+          else console.log("finishHandleMessage")
+        });
+      }
     }
   }
 }
